@@ -10,10 +10,10 @@ on:
     inputs:
       android_personas:
         description: Android personas from personas.json (comma-separated, all = every Android persona, none = skip Android)
-        default: "anna,malik"
+        default: "mehmet,anna,malik,grace"
       ios_personas:
         description: iOS personas from personas.json (comma-separated, all = every iOS persona, none = skip iOS)
-        default: "clara,jonas"
+        default: "none"
       app_dir:
         description: App folder (where package.json is)
         default: demo-app
@@ -51,8 +51,8 @@ on:
         description: "Bug to reproduce instead of exploring: an issue (owner/repo#123 or its URL) or the steps as text. Agents follow it: read it first"
         default: ""
       model:
-        description: "Model: sonnet, opus, haiku (cheapest) or a full Claude id. With llm_base_url, the provider's model name"
-        default: sonnet
+        description: "Model: gemini-2.5-flash (Gemini API), sonnet, opus, haiku or a provider model name"
+        default: gemini-2.5-flash
       llm_base_url:
         description: "Optional: any Anthropic-compatible API instead of Claude (OpenRouter, DeepSeek, Kimi, GLM...), key in the LLM_API_KEY secret. Quality depends on how well the model reads screenshots and reasons: docs/cheaper-models.md"
         default: ""
@@ -231,6 +231,47 @@ jobs:
           GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN || github.token }}
         run: bash scripts/bug_report.sh
 
+      - name: Start Gemini API proxy
+        if: inputs.llm_base_url == ''
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_MODEL: ${{ inputs.model }}
+        run: |
+          if [ -z "${GEMINI_API_KEY:-}" ]; then
+            echo "No GEMINI_API_KEY secret set; skipping Gemini proxy."
+            exit 0
+          fi
+          pip install -q 'litellm[proxy]' google-genai || pip install -q --break-system-packages 'litellm[proxy]' google-genai
+          MODEL_ID="${TARGET_MODEL#gemini/}"
+          cat > /tmp/litellm.yaml <<EOF
+          model_list:
+            - model_name: ${TARGET_MODEL}
+              litellm_params:
+                model: gemini/${MODEL_ID}
+                api_key: os.environ/GEMINI_API_KEY
+          litellm_settings:
+            drop_params: true
+          general_settings:
+            master_key: sk-gemini-proxy
+          EOF
+          litellm --config /tmp/litellm.yaml --host 127.0.0.1 --port 4000 >/tmp/litellm.log 2>&1 &
+          READY=0
+          for i in $(seq 1 45); do
+            if curl -sf http://127.0.0.1:4000/health/liveliness >/dev/null 2>&1; then
+              READY=1
+              echo "Gemini proxy ready ($MODEL_ID)"
+              break
+            fi
+            sleep 1
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "::error::Gemini proxy failed to start"
+            cat /tmp/litellm.log || true
+            exit 1
+          fi
+          echo "GEMINI_PROXY_URL=http://127.0.0.1:4000" >> "$GITHUB_ENV"
+          echo "GEMINI_PROXY_KEY=sk-gemini-proxy" >> "$GITHUB_ENV"
+
       - name: Emulator + agent
         uses: reactivecircus/android-emulator-runner@v2
         env:
@@ -245,8 +286,8 @@ jobs:
           APP_ID: ${{ inputs.app_id }}
           BRIEF: ${{ inputs.bug_report != '' && inputs.brief == 'AGENT_BRIEF.md' && 'briefs/reproduce.md' || inputs.brief }}
           MODEL: ${{ inputs.model }}
-          LLM_BASE_URL: ${{ inputs.llm_base_url }}
-          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ inputs.llm_base_url || env.GEMINI_PROXY_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY || env.GEMINI_PROXY_KEY }}
           BLOCK_HOSTS: ${{ inputs.block_hosts }}
           RECORD_VIDEO: ${{ inputs.record_video }}
         with:
